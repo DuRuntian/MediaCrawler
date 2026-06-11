@@ -271,9 +271,9 @@ def get_browser_cookies_via_playwright():
         # 通过CDP获取Cookie
         cookies = None
         try:
-            # 获取WebSocket URL
-            async with httpx.AsyncClient() as client:
-                response = await client.get(f"http://localhost:{debug_port}/json/version", timeout=10)
+            # 获取WebSocket URL（使用同步方式）
+            with httpx.Client() as client:
+                response = client.get(f"http://localhost:{debug_port}/json/version", timeout=10)
                 if response.status_code == 200:
                     data = response.json()
                     ws_url = data.get("webSocketDebuggerUrl")
