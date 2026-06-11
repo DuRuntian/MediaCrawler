@@ -3,697 +3,606 @@
 
 """
 携程游记爬虫
-功能：爬取携程you.ctrip.com上的游记列表及详情页内容
-输出：Excel文件（标题、作者、出游天数、人均花费、正文、图片链接等）
-支持自动获取Cookie和关键词搜索
+参考MediaCrawler项目架构，使用CDP模式连接本地浏览器
+支持登录后爬取游记内容
 """
 
+import asyncio
 import os
-import platform
-import subprocess
-import time
 import re
-import requests
-from lxml import etree
-from multiprocessing.dummy import Pool
-import openpyxl
-from fake_useragent import UserAgent
-from requests.exceptions import RequestException
+import time
+import json
+from typing import Dict, List, Optional
 from urllib.parse import quote
 
-# ==================== 可配置参数（用户可在此修改） ====================
-# 关键词（可修改为任意目的地或主题，如"上海"、"厦门"、"海边"等）
-KEYWORD = "徐州"
-# 保存路径（默认为当前目录）
-SAVE_PATH = "."
-# 保存格式：excel / txt / both
-SAVE_FORMAT = "excel"
-# 爬取页码范围（1到END_PAGE）
+from playwright.async_api import (
+    BrowserContext,
+    Page,
+    Playwright,
+    async_playwright,
+)
+
+# ==================== 配置参数 ====================
+# 关键词
+KEYWORDS = "兰州"
+# 爬取页数
 START_PAGE = 1
 END_PAGE = 5
-# 并发线程数（建议3~5，过大易被封）
-THREAD_POOL_SIZE = 3
-# 重试次数
-RETRY_TIMES = 3
-# 请求超时（秒）
-TIMEOUT = 20
-# ================================================================
-
-# 浏览器配置
-# 是否使用本地浏览器（True=使用本地Chrome/Edge，False=使用chromedriver-autoinstaller自动下载）
-USE_LOCAL_BROWSER = True
-# 本地浏览器调试端口
-DEBUG_PORT = 9222
-# 自定义浏览器路径（留空则自动检测）
+# 每页最大游记数
+MAX_TRAVELS_PER_PAGE = 20
+# 保存路径
+SAVE_PATH = "./data/ctrip"
+# 保存格式: jsonl / excel / txt
+SAVE_FORMAT = "jsonl"
+# 登录方式: qrcode / cookie
+LOGIN_TYPE = "qrcode"
+# Cookie字符串（如果使用cookie登录方式）
+COOKIES = ""
+# 是否使用CDP模式（连接本地浏览器）
+ENABLE_CDP_MODE = True
+# CDP调试端口
+CDP_DEBUG_PORT = 9222
+# 是否连接已打开的浏览器
+CDP_CONNECT_EXISTING = True
+# 自定义浏览器路径（留空自动检测）
 CUSTOM_BROWSER_PATH = ""
-# ================================================================
-
-# 输出文件名（根据保存格式和关键词生成）
-OUTPUT_FILE_EXCEL = f'{SAVE_PATH}/{KEYWORD}游记.xlsx'
-OUTPUT_FILE_TXT = f'{SAVE_PATH}/{KEYWORD}游记.txt'
-
-# 构建搜索页URL模板（支持关键词搜索）
-BASE_URL = f'https://you.ctrip.com/search/travels/{{}}?keyword={quote(KEYWORD)}'
-
-# 请求头配置
-ua = UserAgent()
-HEADERS = {
-    'User-Agent': ua.random,
-    'Referer': 'https://you.ctrip.com/',
-    'Cookie': '',
-}
+# 是否无头模式
+HEADLESS = False
+# 是否保存登录状态
+SAVE_LOGIN_STATE = True
+# 爬取间隔（秒）
+CRAWLER_SLEEP_SEC = 2
+# 浏览器超时（秒）
+BROWSER_LAUNCH_TIMEOUT = 60
+# ================================================
 
 
-# ==================== 浏览器管理类（参考MediaCrawler项目） ====================
-
-class BrowserLauncher:
-    """浏览器启动器，检测和启动本地Chrome/Edge浏览器"""
+class CtripTravelCrawler:
+    """携程游记爬虫"""
 
     def __init__(self):
-        self.system = platform.system()
-        self.browser_process = None
-        self.debug_port = None
+        self.index_url = "https://you.ctrip.com"
+        self.search_url_template = "https://you.ctrip.com/searchsite/travels/?query={keyword}&isAnswered=&isRecommended=&publishDate=&PageNo={page}"
+        self.browser_context: Optional[BrowserContext] = None
+        self.context_page: Optional[Page] = None
+        self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        self.cdp_manager = None
+        self.all_travels_data: List[Dict] = []
 
-    def detect_browser_paths(self):
-        """检测系统中可用的浏览器路径"""
-        paths = []
+    async def start(self):
+        """启动爬虫"""
+        print("=" * 50)
+        print("携程游记爬虫启动")
+        print(f"关键词: {KEYWORDS}")
+        print(f"页数范围: {START_PAGE} - {END_PAGE}")
+        print(f"CDP模式: {ENABLE_CDP_MODE}")
+        print("=" * 50)
 
-        if self.system == "Windows":
-            possible_paths = [
-                os.path.expandvars(r"%PROGRAMFILES%\Google\Chrome\Application\chrome.exe"),
-                os.path.expandvars(r"%PROGRAMFILES(X86)%\Google\Chrome\Application\chrome.exe"),
-                os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-                os.path.expandvars(r"%PROGRAMFILES%\Microsoft\Edge\Application\msedge.exe"),
-                os.path.expandvars(r"%PROGRAMFILES(X86)%\Microsoft\Edge\Application\msedge.exe"),
-            ]
-        elif self.system == "Darwin":  # macOS
-            possible_paths = [
-                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-                "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta",
-                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-            ]
-        else:  # Linux
-            possible_paths = [
-                "/usr/bin/google-chrome",
-                "/usr/bin/google-chrome-stable",
-                "/usr/bin/chromium-browser",
-                "/usr/bin/chromium",
-                "/usr/bin/microsoft-edge",
-            ]
+        # 创建保存目录
+        os.makedirs(SAVE_PATH, exist_ok=True)
 
-        for path in possible_paths:
-            if os.path.isfile(path) and os.access(path, os.X_OK):
-                paths.append(path)
+        async with async_playwright() as playwright:
+            # 启动浏览器
+            if ENABLE_CDP_MODE:
+                print("[浏览器] 使用CDP模式启动...")
+                self.browser_context = await self.launch_browser_with_cdp(playwright)
+            else:
+                print("[浏览器] 使用标准模式启动...")
+                chromium = playwright.chromium
+                self.browser_context = await self.launch_browser_standard(chromium)
 
-        return paths
+            # 创建页面
+            self.context_page = await self.browser_context.new_page()
 
-    def find_available_port(self, start_port=9222):
-        """查找可用端口"""
-        import socket
-        port = start_port
-        while port < start_port + 100:
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.bind(('localhost', port))
-                    return port
-            except OSError:
-                port += 1
-        raise RuntimeError(f"无法找到可用端口，从 {start_port} 到 {port-1}")
+            # 登录
+            await self.login()
 
-    def launch_browser(self, browser_path, debug_port, headless=False, user_data_dir=None):
-        """启动浏览器进程"""
-        args = [
-            browser_path,
-            f"--remote-debugging-port={debug_port}",
-            "--remote-debugging-address=0.0.0.0",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
-            "--disable-features=TranslateUI",
-            "--disable-ipc-flooding-protection",
-            "--disable-hang-monitor",
-            "--disable-prompt-on-repost",
-            "--disable-sync",
-            "--disable-dev-shm-usage",
-            "--no-sandbox",
-            "--disable-blink-features=AutomationControlled",
-            "--exclude-switches=enable-automation",
-            "--disable-infobars",
-        ]
+            # 搜索并爬取
+            await self.search_and_crawl()
 
-        if headless:
-            args.extend(["--headless=new", "--disable-gpu"])
-        else:
-            args.extend(["--start-maximized"])
+            # 保存数据
+            await self.save_data()
 
-        if user_data_dir:
-            args.append(f"--user-data-dir={user_data_dir}")
+            # 关闭浏览器
+            await self.close_browser()
 
-        print(f"[浏览器] 启动中: {browser_path}")
-        print(f"[浏览器] 调试端口: {debug_port}")
+        print(f"\n爬取完成！共获取 {len(self.all_travels_data)} 篇游记")
 
-        if self.system == "Windows":
-            process = subprocess.Popen(
-                args,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+    async def launch_browser_with_cdp(self, playwright: Playwright) -> BrowserContext:
+        """使用CDP模式启动浏览器"""
+        from tools.cdp_browser import CDPBrowserManager
+        from tools.browser_launcher import BrowserLauncher
+
+        self.cdp_manager = CDPBrowserManager()
+
+        # 连接已存在的浏览器或启动新浏览器
+        if CDP_CONNECT_EXISTING:
+            print(f"[CDP] 连接已存在的浏览器，端口 {CDP_DEBUG_PORT}")
+            print("[CDP] 请确保浏览器已开启远程调试: chrome://inspect/#remote-debugging")
+            browser_context = await self.cdp_manager.launch_and_connect(
+                playwright,
+                playwright_proxy=None,
+                user_agent=self.user_agent,
+                headless=HEADLESS,
             )
         else:
-            process = subprocess.Popen(
-                args,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                preexec_fn=os.setsid
+            # 自动检测并启动浏览器
+            launcher = BrowserLauncher()
+            browser_paths = launcher.detect_browser_paths()
+
+            if CUSTOM_BROWSER_PATH and os.path.isfile(CUSTOM_BROWSER_PATH):
+                browser_path = CUSTOM_BROWSER_PATH
+            elif browser_paths:
+                browser_path = browser_paths[0]
+                browser_name, browser_version = launcher.get_browser_info(browser_path)
+                print(f"[CDP] 检测到浏览器: {browser_name} ({browser_version})")
+            else:
+                raise RuntimeError("未找到本地浏览器，请安装Chrome或Edge")
+
+            browser_context = await self.cdp_manager.launch_and_connect(
+                playwright,
+                playwright_proxy=None,
+                user_agent=self.user_agent,
+                headless=HEADLESS,
             )
 
-        self.browser_process = process
-        return process
+        return browser_context
 
-    def wait_for_browser_ready(self, debug_port, timeout=30):
-        """等待浏览器就绪"""
-        import socket
-        print(f"[浏览器] 等待浏览器启动... (端口 {debug_port})")
+    async def launch_browser_standard(self, chromium, headless: bool = True) -> BrowserContext:
+        """标准模式启动浏览器"""
+        browser_context = await chromium.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent=self.user_agent,
+        )
 
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(1)
-                    if s.connect_ex(('localhost', debug_port)) == 0:
-                        print("[浏览器] 浏览器已就绪")
-                        return True
-            except Exception:
-                pass
-            time.sleep(0.5)
+        # 添加反检测脚本
+        if os.path.exists("libs/stealth.min.js"):
+            await browser_context.add_init_script(path="libs/stealth.min.js")
 
-        print("[浏览器] 浏览器启动超时")
-        return False
+        return browser_context
 
-    def get_browser_info(self, browser_path):
-        """获取浏览器信息"""
-        try:
-            name = "Unknown"
-            if "chrome" in browser_path.lower():
-                name = "Google Chrome"
-            elif "edge" in browser_path.lower() or "msedge" in browser_path.lower():
-                name = "Microsoft Edge"
-            elif "chromium" in browser_path.lower():
-                name = "Chromium"
+    async def login(self):
+        """登录携程"""
+        print("\n[登录] 开始登录流程...")
 
-            result = subprocess.run([browser_path, "--version"],
-                                  capture_output=True, text=True, encoding='utf-8', errors='ignore', timeout=5)
-            version = result.stdout.strip() if result.stdout else "Unknown"
-            return name, version
-        except Exception:
-            return "Unknown", "Unknown"
+        # 访问携程首页
+        await self.context_page.goto(self.index_url, timeout=30000)
+        await asyncio.sleep(2)
 
-    def cleanup(self):
-        """清理浏览器进程"""
-        if not self.browser_process:
+        # 检查登录状态
+        is_logged_in = await self.check_login_state()
+
+        if is_logged_in:
+            print("[登录] 已登录，跳过登录流程")
             return
 
-        print("[浏览器] 关闭中...")
+        if LOGIN_TYPE == "qrcode":
+            await self.login_by_qrcode()
+        elif LOGIN_TYPE == "cookie":
+            await self.login_by_cookie()
+
+    async def check_login_state(self) -> bool:
+        """检查登录状态"""
         try:
-            if self.system == "Windows":
-                self.browser_process.terminate()
-                self.browser_process.wait(timeout=5)
-            else:
-                import signal
-                os.killpg(os.getpgid(self.browser_process.pid), signal.SIGTERM)
-                self.browser_process.wait(timeout=5)
+            # 检查是否有用户头像或用户名元素
+            user_selector = "xpath=//div[contains(@class, 'user')]//a[contains(@href, '/user/')]"
+            is_visible = await self.context_page.is_visible(user_selector, timeout=3000)
+
+            if is_visible:
+                print("[登录] 检测到用户元素，已登录")
+                return True
+
+            # 检查Cookie
+            cookies = await self.browser_context.cookies()
+            cookie_dict = {c['name']: c['value'] for c in cookies}
+
+            # 检查关键Cookie
+            if cookie_dict.get('_u') or cookie_dict.get('ticket'):
+                print("[登录] 检测到登录Cookie")
+                return True
+
         except Exception as e:
-            print(f"[浏览器] 关闭异常: {e}")
-        finally:
-            self.browser_process = None
+            print(f"[登录] 检查登录状态异常: {e}")
 
+        return False
 
-def get_browser_cookies_via_playwright():
-    """
-    使用Playwright通过CDP连接本地浏览器获取Cookie
-    """
-    try:
-        from playwright.sync_api import sync_playwright
-        import httpx
+    async def login_by_qrcode(self):
+        """扫码登录"""
+        print("[登录] 请使用携程App扫码登录...")
 
-        launcher = BrowserLauncher()
+        # 点击登录按钮
+        try:
+            login_btn = await self.context_page.wait_for_selector(
+                "xpath=//a[contains(text(), '登录') or contains(@class, 'login')]",
+                timeout=5000
+            )
+            if login_btn:
+                await login_btn.click()
+                await asyncio.sleep(2)
+        except Exception:
+            print("[登录] 未找到登录按钮，可能已弹出登录框")
 
-        # 获取浏览器路径
-        browser_path = None
-        if CUSTOM_BROWSER_PATH and os.path.isfile(CUSTOM_BROWSER_PATH):
-            browser_path = CUSTOM_BROWSER_PATH
-        else:
-            browser_paths = launcher.detect_browser_paths()
-            if browser_paths:
-                browser_path = browser_paths[0]
+        # 等待用户扫码
+        max_wait_time = 120  # 最大等待时间
+        start_time = time.time()
 
-        if not browser_path:
-            print("[错误] 未找到本地浏览器，请安装Chrome或Edge")
-            return None
+        while time.time() - start_time < max_wait_time:
+            is_logged_in = await self.check_login_state()
+            if is_logged_in:
+                print("[登录] 扫码登录成功！")
 
-        browser_name, browser_version = launcher.get_browser_info(browser_path)
-        print(f"[浏览器] 检测到: {browser_name} ({browser_version})")
+                # 保存登录状态
+                if SAVE_LOGIN_STATE:
+                    await self.save_login_state()
+                return
 
-        # 启动浏览器
-        debug_port = launcher.find_available_port(DEBUG_PORT)
-        user_data_dir = os.path.join(os.getcwd(), "browser_data", "ctrip_cookies")
+            await asyncio.sleep(2)
+            remaining = int(max_wait_time - (time.time() - start_time))
+            if remaining % 10 == 0:
+                print(f"[登录] 等待扫码... 剩余 {remaining} 秒")
+
+        raise RuntimeError("扫码登录超时")
+
+    async def login_by_cookie(self):
+        """Cookie登录"""
+        print("[登录] 使用Cookie登录...")
+
+        if not COOKIES:
+            raise ValueError("未配置COOKIES")
+
+        # 解析Cookie字符串
+        cookie_list = []
+        for item in COOKIES.split(';'):
+            item = item.strip()
+            if '=' in item:
+                name, value = item.split('=', 1)
+                cookie_list.append({
+                    'name': name.strip(),
+                    'value': value.strip(),
+                    'domain': '.ctrip.com',
+                    'path': '/'
+                })
+
+        await self.browser_context.add_cookies(cookie_list)
+        print(f"[登录] 已添加 {len(cookie_list)} 个Cookie")
+
+        # 刷新页面验证
+        await self.context_page.reload()
+        await asyncio.sleep(2)
+
+        is_logged_in = await self.check_login_state()
+        if not is_logged_in:
+            raise RuntimeError("Cookie登录失败，请检查Cookie是否有效")
+
+        print("[登录] Cookie登录成功")
+
+    async def save_login_state(self):
+        """保存登录状态"""
+        user_data_dir = os.path.join(os.getcwd(), "browser_data", "ctrip_user_data_dir")
         os.makedirs(user_data_dir, exist_ok=True)
 
-        launcher.launch_browser(browser_path, debug_port, headless=True, user_data_dir=user_data_dir)
+        cookies = await self.browser_context.cookies()
+        cookie_file = os.path.join(user_data_dir, "cookies.json")
 
-        if not launcher.wait_for_browser_ready(debug_port, timeout=30):
-            print("[错误] 浏览器启动失败")
-            launcher.cleanup()
-            return None
+        with open(cookie_file, 'w', encoding='utf-8') as f:
+            json.dump(cookies, f, ensure_ascii=False, indent=2)
 
-        # 通过CDP获取Cookie
-        cookies = None
-        try:
-            # 获取WebSocket URL（使用同步方式）
-            with httpx.Client() as client:
-                response = client.get(f"http://localhost:{debug_port}/json/version", timeout=10)
-                if response.status_code == 200:
-                    data = response.json()
-                    ws_url = data.get("webSocketDebuggerUrl")
+        print(f"[登录] 已保存登录状态到: {cookie_file}")
 
-                    # 使用Playwright连接
-                    with sync_playwright() as p:
-                        browser = p.chromium.connect_over_cdp(ws_url, timeout=10000)
-                        if browser.contexts:
-                            context = browser.contexts[0]
-                            # 访问携程获取Cookie
-                            page = context.new_page()
-                            search_url = f'https://you.ctrip.com/search/travels/?keyword={quote(KEYWORD)}'
-                            page.goto(search_url, timeout=30000)
-                            time.sleep(3)
-                            cookies = context.cookies()
-                            browser.close()
+    async def search_and_crawl(self):
+        """搜索并爬取游记"""
+        print("\n[爬取] 开始搜索游记...")
 
-        except Exception as e:
-            print(f"[CDP] 连接异常: {e}")
+        for page_num in range(START_PAGE, END_PAGE + 1):
+            search_url = self.search_url_template.format(
+                keyword=quote(KEYWORDS),
+                page=page_num
+            )
 
-        launcher.cleanup()
-        return cookies
+            print(f"\n[爬取] 第 {page_num} 页: {search_url}")
 
-    except ImportError as e:
-        print(f"[错误] Playwright未安装: {e}")
-        print("提示：pip install playwright && playwright install")
-        return None
-    except Exception as e:
-        print(f"[错误] 获取Cookie失败: {e}")
-        return None
+            try:
+                await self.context_page.goto(search_url, timeout=30000)
+                await asyncio.sleep(CRAWLER_SLEEP_SEC)
 
+                # 解析列表页获取游记链接
+                travel_links = await self.parse_travel_list()
 
-def get_cookies_flexible():
-    """
-    灵活的Cookie获取策略
-    """
-    cookies = None
+                print(f"[爬取] 第 {page_num} 页找到 {len(travel_links)} 篇游记")
 
-    # 方式1：使用Playwright + 本地浏览器（通过CDP连接）
-    if USE_LOCAL_BROWSER:
-        print("[Cookie] 正在使用本地浏览器获取Cookie...")
-        cookies = get_browser_cookies_via_playwright()
-        if cookies:
-            return cookies
+                # 爬取每篇游记详情
+                for idx, travel_info in enumerate(travel_links[:MAX_TRAVELS_PER_PAGE]):
+                    print(f"[爬取] 正在爬取第 {idx + 1} 篇: {travel_info['title'][:30]}...")
+                    detail_data = await self.crawl_travel_detail(travel_info)
+                    self.all_travels_data.append(detail_data)
+                    await asyncio.sleep(CRAWLER_SLEEP_SEC)
 
-    # 方式2：使用chromedriver-autoinstaller自动下载
-    print("[Cookie] 正在使用自动下载浏览器获取Cookie...")
-    try:
-        import chromedriver_autoinstaller
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-
-        chromedriver_autoinstaller.install()
-        chrome_options = Options()
-        chrome_options.add_argument('--headless=new')
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument(f'--user-agent={ua.random}')
-
-        driver = webdriver.Chrome(options=chrome_options)
-        try:
-            search_url = f'https://you.ctrip.com/search/travels/?keyword={quote(KEYWORD)}'
-            driver.get(search_url)
-            time.sleep(3)
-            cookies = driver.get_cookies()
-            print(f"[Selenium] 获取到 {len(cookies)} 个Cookie")
-            return {c['name']: c['value'] for c in cookies}
-        finally:
-            driver.quit()
-    except Exception as e:
-        print(f"[Selenium] 失败: {e}")
-
-    print("[警告] 无法自动获取Cookie，将使用受限访问")
-    return {}
-
-
-def update_headers_with_cookies(cookies):
-    """更新请求头中的Cookie"""
-    if cookies:
-        if isinstance(cookies, list):
-            cookie_str = '; '.join([f"{c['name']}={c['value']}" for c in cookies])
-        else:
-            cookie_str = '; '.join([f'{k}={v}' for k, v in cookies.items()])
-        HEADERS['Cookie'] = cookie_str
-        print(f"[Cookie] 已更新 ({len(cookies)} 项)")
-
-
-def get_page(url, retry=RETRY_TIMES):
-    """获取页面HTML，带重试机制"""
-    for attempt in range(retry):
-        try:
-            response = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-            if response.status_code == 200:
-                return response.text
-            else:
-                print(f"请求失败，状态码: {response.status_code}")
-        except RequestException as e:
-            print(f"请求异常: {e}")
-        time.sleep(3)
-    return None
-
-
-def parse_travel_list(html):
-    """解析游记列表页，提取每篇游记的基本信息"""
-    selector = etree.HTML(html)
-    results = []
-
-    # 多种XPath策略
-    xpath_strategies = [
-        '//a[contains(@href, "/travels/")]',  # 最广泛匹配
-        '//div[contains(@class, "travel-item")]//a',
-        '//div[contains(@class, "journal-item")]//a',
-        '//a[contains(@class, "journal")]',
-        '//a[contains(@class, "post")]',
-        '//div[@class="container"]//a[contains(@href, "/travels/")]',
-    ]
-
-    travel_items = []
-    for xpath in xpath_strategies:
-        travel_items = selector.xpath(xpath)
-        if travel_items:
-            print(f"[解析] 使用策略 '{xpath}' 找到 {len(travel_items)} 个元素")
-            break
-
-    for item in travel_items:
-        try:
-            href = item.xpath('./@href')
-            href = href[0] if href else ''
-
-            if not href or '/travels/' not in href:
+            except Exception as e:
+                print(f"[爬取] 第 {page_num} 页爬取失败: {e}")
                 continue
 
-            # 尝试多种方式获取标题
-            title = ''
-            for title_xpath in ['.//h2//text()', './/h3//text()', './/span//text()',
-                               './/div[contains(@class, "title")]//text()',
-                               './/a//text()', './/text()']:
-                title_elem = item.xpath(title_xpath)
-                if title_elem:
-                    title = ''.join([t.strip() for t in title_elem if t.strip()])
-                    if title and len(title) > 3:
-                        break
+    async def parse_travel_list(self) -> List[Dict]:
+        """解析游记列表页"""
+        travel_links = []
 
-            if not title or len(title) < 5:
-                title_match = re.search(r'/travels/[^/]+/(\d+)\.html', href)
-                if title_match:
-                    title = f"游记-{title_match.group(1)}"
+        try:
+            # 等待页面加载
+            await self.context_page.wait_for_load_state("networkidle", timeout=10000)
 
-            # 获取作者
-            author = '匿名'
-            for author_xpath in ['.//span[contains(@class, "author")]//text()',
-                                 './/div[contains(@class, "author")]//text()',
-                                 './/span[contains(@class, "name")]//text()',
-                                 './/div[contains(@class, "user")]//text()']:
-                author_elem = item.xpath(author_xpath)
-                if author_elem:
-                    author = ''.join([a.strip() for a in author_elem if a.strip()])
-                    if author:
-                        break
+            # 使用XPath获取游记链接（参考教程）
+            # 携程搜索页游记链接结构: /html/body/div[2]/div[2]/div[2]/div/div[1]/ul/li
+            travel_items = await self.context_page.locator(
+                "xpath=//ul[contains(@class, 'search_result_list')]//li//a[contains(@href, '/travels/')]"
+            ).all()
 
-            # 获取摘要
-            summary = ''
-            for summary_xpath in ['.//p[contains(@class, "desc")]//text()',
-                                 './/p[contains(@class, "summary")]//text()',
-                                 './/div[contains(@class, "summary")]//text()',
-                                 './/p//text()']:
-                summary_elem = item.xpath(summary_xpath)
-                if summary_elem:
-                    summary = ''.join([s.strip() for s in summary_elem if s.strip()])
-                    if summary and len(summary) > 10:
-                        break
+            if not travel_items:
+                # 备选方案
+                travel_items = await self.context_page.locator(
+                    "xpath=//a[contains(@href, '/travels/') and contains(@href, '.html')]"
+                ).all()
 
-            url = href
-            if url and not url.startswith('http'):
-                url = f'https://you.ctrip.com{url}'
+            print(f"[解析] 找到 {len(travel_items)} 个游记链接元素")
 
-            if url and title:
-                results.append({
-                    'title': title,
-                    'url': url,
-                    'summary': summary[:200] if summary else '',
-                    'author': author
-                })
+            for item in travel_items:
+                try:
+                    href = await item.get_attribute('href')
+                    if not href or '/travels/' not in href:
+                        continue
+
+                    # 获取标题
+                    title = await item.inner_text()
+                    title = title.strip() if title else ''
+
+                    if not title:
+                        # 从链接中提取ID作为标题
+                        match = re.search(r'/travels/[^/]+/(\d+)\.html', href)
+                        if match:
+                            title = f"游记-{match.group(1)}"
+
+                    # 补全URL
+                    if href.startswith('/'):
+                        url = f"https://you.ctrip.com{href}"
+                    else:
+                        url = href
+
+                    travel_links.append({
+                        'title': title,
+                        'url': url,
+                    })
+
+                except Exception as e:
+                    print(f"[解析] 解析单个游记链接失败: {e}")
+                    continue
+
         except Exception as e:
-            print(f"解析条目时出错: {e}")
-            continue
+            print(f"[解析] 解析列表页失败: {e}")
 
-    # 去重
-    seen = set()
-    unique_results = []
-    for r in results:
-        if r['url'] not in seen:
-            seen.add(r['url'])
-            unique_results.append(r)
+        # 去重
+        seen_urls = set()
+        unique_links = []
+        for link in travel_links:
+            if link['url'] not in seen_urls:
+                seen_urls.add(link['url'])
+                unique_links.append(link)
 
-    print(f"[解析] 列表页共找到 {len(unique_results)} 篇游记")
-    return unique_results
+        return unique_links
+
+    async def crawl_travel_detail(self, travel_info: Dict) -> Dict:
+        """爬取游记详情页"""
+        detail_data = travel_info.copy()
+
+        try:
+            await self.context_page.goto(travel_info['url'], timeout=30000)
+            await asyncio.sleep(1)
+
+            # 等待页面加载完成
+            await self.context_page.wait_for_load_state("networkidle", timeout=10000)
+
+            # 滚动页面加载完整内容
+            await self.scroll_page()
+
+            # 解析详情页
+            await self.parse_travel_detail(detail_data)
+
+        except Exception as e:
+            print(f"[详情] 爬取详情页失败: {e}")
+            detail_data['content'] = f"获取失败: {e}"
+            detail_data['error'] = str(e)
+
+        return detail_data
+
+    async def scroll_page(self):
+        """滚动页面加载完整内容"""
+        try:
+            for i in range(5):
+                await self.context_page.evaluate("window.scrollBy(0, 500)")
+                await asyncio.sleep(0.5)
+        except Exception:
+            pass
+
+    async def parse_travel_detail(self, detail_data: Dict):
+        """解析游记详情页"""
+        try:
+            # 提取标题
+            try:
+                title_elem = await self.context_page.locator(
+                    "xpath=//h1[contains(@class, 'title')] | //h2[contains(@class, 'title')] | //div[@class='ctd_head_con']/h1"
+                ).first.inner_text()
+                if title_elem:
+                    detail_data['title'] = title_elem.strip()
+            except Exception:
+                pass
+
+            # 提取作者
+            try:
+                author_elem = await self.context_page.locator(
+                    "xpath=//div[contains(@class, 'author')]//a | //span[contains(@class, 'author-name')] | //a[contains(@class, 'user')]"
+                ).first.inner_text()
+                detail_data['author'] = author_elem.strip() if author_elem else '匿名'
+            except Exception:
+                detail_data['author'] = '匿名'
+
+            # 提取正文内容（关键XPath: class="ctd_content"）
+            try:
+                content_elem = await self.context_page.locator(
+                    "xpath=//div[@class='ctd_content'] | //div[contains(@class, 'ctd_content')] | //div[contains(@class, 'article-content')] | //div[contains(@class, 'travel-content')]"
+                ).first.inner_text()
+                detail_data['content'] = content_elem.strip() if content_elem else ''
+            except Exception:
+                # 备选方案：获取所有段落文本
+                try:
+                    paragraphs = await self.context_page.locator(
+                        "xpath=//div[contains(@class, 'content')]//p | //article//p"
+                    ).all_inner_texts()
+                    detail_data['content'] = '\n'.join(paragraphs)
+                except Exception:
+                    detail_data['content'] = ''
+
+            # 提取游记信息（天数、人均、时间等）
+            try:
+                info_items = await self.context_page.locator(
+                    "xpath=//ul[contains(@class, 'ctd_des_list')]//li | //div[contains(@class, 'travel-info')]//span"
+                ).all_inner_texts()
+
+                info_str = ' '.join(info_items)
+
+                # 提取天数
+                days_match = re.search(r'(\d+)\s*天', info_str)
+                detail_data['travel_days'] = days_match.group(1) if days_match else ''
+
+                # 提取人均花费
+                cost_match = re.search(r'人均[^\d]*(\d+)', info_str)
+                detail_data['per_capita_cost'] = cost_match.group(1) if cost_match else ''
+
+                # 提取时间
+                time_match = re.search(r'时间[^\d]*(\d+[^\d]*\d*[^\d]*\d*)', info_str)
+                detail_data['travel_time'] = time_match.group(1) if time_match else ''
+
+                # 提取和谁出行
+                who_match = re.search(r'和谁[^\d\w]*(\w+)', info_str)
+                detail_data['travel_partner'] = who_match.group(1) if who_match else ''
+
+            except Exception:
+                pass
+
+            # 提取发布时间
+            try:
+                time_elem = await self.context_page.locator(
+                    "xpath=//div[@class='time'] | //span[contains(@class, 'time')] | //div[contains(@class, 'date')]"
+                ).first.inner_text()
+                time_match = re.search(r'(\d{4}-\d{1,2}-\d{1,2})', time_elem)
+                detail_data['publish_date'] = time_match.group(1) if time_match else time_elem.strip()
+            except Exception:
+                detail_data['publish_date'] = ''
+
+            # 提取图片链接
+            try:
+                img_elements = await self.context_page.locator(
+                    "xpath=//div[contains(@class, 'ctd_content')]//img | //div[contains(@class, 'content')]//img | //article//img"
+                ).all()
+
+                img_urls = []
+                for img in img_elements[:20]:
+                    src = await img.get_attribute('src')
+                    if src and not src.startswith('data:'):
+                        if src.startswith('//'):
+                            src = f'https:{src}'
+                        img_urls.append(src)
+
+                detail_data['image_urls'] = img_urls
+                detail_data['image_count'] = len(img_urls)
+            except Exception:
+                detail_data['image_urls'] = []
+                detail_data['image_count'] = 0
+
+            # 提取浏览数、评论数、喜欢数
+            try:
+                view_elem = await self.context_page.locator(
+                    "xpath=//span[contains(@class, 'view')] | //span[contains(text(), '浏览')]"
+                ).first.inner_text()
+                view_match = re.search(r'(\d+)', view_elem)
+                detail_data['view_count'] = view_match.group(1) if view_match else '0'
+            except Exception:
+                detail_data['view_count'] = '0'
+
+            print(f"[详情] 内容长度: {len(detail_data.get('content', ''))} 字符, 图片: {detail_data.get('image_count', 0)} 张")
+
+        except Exception as e:
+            print(f"[详情] 解析详情页失败: {e}")
+
+    async def save_data(self):
+        """保存数据"""
+        print(f"\n[保存] 保存数据到 {SAVE_PATH}...")
+
+        filename = os.path.join(SAVE_PATH, f"{KEYWORDS}_游记.{SAVE_FORMAT}")
+
+        if SAVE_FORMAT == "jsonl":
+            with open(filename, 'w', encoding='utf-8') as f:
+                for item in self.all_travels_data:
+                    f.write(json.dumps(item, ensure_ascii=False) + '\n')
+
+        elif SAVE_FORMAT == "json":
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(self.all_travels_data, f, ensure_ascii=False, indent=2)
+
+        elif SAVE_FORMAT == "txt":
+            with open(filename, 'w', encoding='utf-8') as f:
+                for i, item in enumerate(self.all_travels_data, 1):
+                    f.write(f"{'='*50}\n")
+                    f.write(f"【第{i}篇】 {item.get('title', '')}\n")
+                    f.write(f"作者: {item.get('author', '')}\n")
+                    f.write(f"链接: {item.get('url', '')}\n")
+                    f.write(f"天数: {item.get('travel_days', '')}\n")
+                    f.write(f"人均: {item.get('per_capita_cost', '')}\n")
+                    f.write(f"发布时间: {item.get('publish_date', '')}\n")
+                    f.write(f"浏览: {item.get('view_count', '')}\n")
+                    f.write(f"图片数: {item.get('image_count', 0)}\n")
+                    f.write(f"\n正文:\n{item.get('content', '')}\n")
+                    if item.get('image_urls'):
+                        f.write(f"\n图片链接:\n{'; '.join(item.get('image_urls', []))}\n")
+                    f.write(f"{'='*50}\n\n")
+
+        elif SAVE_FORMAT == "excel":
+            import openpyxl
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = KEYWORDS
+
+            headers = ['标题', '作者', '链接', '正文', '天数', '人均', '发布时间', '浏览数', '图片数', '图片链接']
+            ws.append(headers)
+
+            for item in self.all_travels_data:
+                row = [
+                    item.get('title', ''),
+                    item.get('author', ''),
+                    item.get('url', ''),
+                    item.get('content', ''),
+                    item.get('travel_days', ''),
+                    item.get('per_capita_cost', ''),
+                    item.get('publish_date', ''),
+                    item.get('view_count', ''),
+                    item.get('image_count', 0),
+                    '; '.join(item.get('image_urls', []))
+                ]
+                ws.append(row)
+
+            wb.save(filename)
+
+        print(f"[保存] 已保存 {len(self.all_travels_data)} 条数据到: {filename}")
+
+    async def close_browser(self):
+        """关闭浏览器"""
+        if self.cdp_manager:
+            await self.cdp_manager.cleanup()
+        elif self.browser_context:
+            await self.browser_context.close()
 
 
-def parse_travel_detail(html, base_data):
-    """解析游记详情页"""
-    selector = etree.HTML(html)
-
-    # 尝试多种方式提取正文
-    content_selectors = [
-        '//div[contains(@class, "article-content")]//text()',
-        '//div[contains(@class, "rich_media_content")]//text()',
-        '//div[contains(@class, "travel-content")]//text()',
-        '//div[contains(@class, "content")]//text()',
-        '//div[contains(@class, "main-content")]//text()',
-        '//article//text()',
-        '//div[contains(@class, "detail")]//text()',
-        '//div[contains(@class, "text")]//text()',
-        '//div[contains(@id, "content")]//text()',
-        '//div[contains(@class, "bd")]//text()',
-    ]
-
-    full_content = ''
-    for content_xpath in content_selectors:
-        content_blocks = selector.xpath(content_xpath)
-        if content_blocks:
-            full_content = ''.join(content_blocks).strip()
-            full_content = re.sub(r'\s+', ' ', full_content)
-            if len(full_content) > 100:
-                print(f"[详情解析] 使用策略 '{content_xpath}' 获取到 {len(full_content)} 字符")
-                break
-
-    # 提取图片链接
-    img_urls = []
-    img_selectors = [
-        '//div[contains(@class, "article-content")]//img/@src',
-        '//div[contains(@class, "rich_media_content")]//img/@src',
-        '//div[contains(@class, "travel-content")]//img/@src',
-        '//img[contains(@class, "content-img")]/@src',
-        '//article//img/@src',
-        '//div[contains(@class, "content")]//img/@src',
-        '//div[contains(@class, "main-content")]//img/@src',
-        '//img/@src',
-    ]
-
-    for img_xpath in img_selectors:
-        img_elements = selector.xpath(img_xpath)
-        if img_elements:
-            for img in img_elements:
-                if img and not img.startswith('data:') and 'http' in img:
-                    if img.startswith('//'):
-                        img = f'https:{img}'
-                    img_urls.append(img)
-            if img_urls:
-                print(f"[详情解析] 使用策略 '{img_xpath}' 获取到 {len(img_urls)} 张图片")
-                break
-
-    # 提取meta信息
-    meta_selectors = [
-        '//div[contains(@class, "travel-info")]//text()',
-        '//div[contains(@class, "info-bar")]//text()',
-        '//div[contains(@class, "meta")]//text()',
-        '//div[contains(@class, "tag")]//text()',
-        '//div[contains(@class, "info")]//text()',
-        '//span[contains(@class, "days")]//text()',
-        '//span[contains(@class, "cost")]//text()',
-    ]
-
-    meta_str = ''
-    for meta_xpath in meta_selectors:
-        meta_text = selector.xpath(meta_xpath)
-        if meta_text:
-            meta_str = ''.join(meta_text)
-            if meta_str:
-                break
-
-    # 正则提取出游天数
-    days_match = re.search(r'(\d+)\s*天', meta_str)
-    travel_days = days_match.group(1) if days_match else ''
-
-    # 正则提取人均花费
-    cost_match = re.search(r'人均[花费]*[\:：]?\s*(\d+)', meta_str)
-    per_capita_cost = cost_match.group(1) if cost_match else ''
-
-    # 提取发布时间
-    time_match = re.search(r'(\d{4}-\d{1,2}-\d{1,2})', meta_str)
-    publish_date = time_match.group(1) if time_match else ''
-
-    base_data.update({
-        'content': full_content,
-        'image_urls': '; '.join(img_urls[:20]),
-        'image_count': len(img_urls),
-        'travel_days': travel_days,
-        'per_capita_cost': per_capita_cost,
-        'publish_date': publish_date
-    })
-
-    return base_data
-
-
-def fetch_and_parse_detail(travel_item):
-    """获取详情页并解析"""
-    url = travel_item.get('url')
-    if not url:
-        return travel_item
-
-    print(f"正在爬取: {travel_item.get('title', '未知标题')}")
-    html = get_page(url)
-    if html:
-        travel_item = parse_travel_detail(html, travel_item)
-        # 打印内容长度帮助调试
-        content_len = len(travel_item.get('content', ''))
-        print(f"  -> 获取到内容 {content_len} 字符，图片 {travel_item.get('image_count', 0)} 张")
-    else:
-        travel_item.update({'content': '获取失败', 'image_urls': '', 'image_count': 0})
-        print(f"  -> 获取详情页失败")
-
-    time.sleep(0.5)
-    return travel_item
-
-
-def save_to_txt(data_list, filename):
-    """保存数据到Txt"""
-    with open(filename, 'w', encoding='utf-8') as f:
-        for i, item in enumerate(data_list, 1):
-            f.write(f"{'='*50}\n")
-            f.write(f"【第{i}篇】\n")
-            f.write(f"标题: {item.get('title', '')}\n")
-            f.write(f"作者: {item.get('author', '')}\n")
-            f.write(f"链接: {item.get('url', '')}\n")
-            f.write(f"摘要: {item.get('summary', '')}\n")
-            f.write(f"出游天数: {item.get('travel_days', '')}天\n")
-            f.write(f"人均花费: {item.get('per_capita_cost', '')}元\n")
-            f.write(f"发布日期: {item.get('publish_date', '')}\n")
-            f.write(f"图片数量: {item.get('image_count', 0)}\n")
-            f.write(f"正文: {item.get('content', '')}\n")
-            f.write(f"图片链接: {item.get('image_urls', '')}\n")
-            f.write(f"{'='*50}\n\n")
-    print(f"数据已保存至: {filename}")
-
-
-def save_to_excel(data_list, filename):
-    """保存数据到Excel"""
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = f'{KEYWORD}游记'
-
-    headers = ['标题', '作者', '链接', '摘要', '正文', '出游天数', '人均花费',
-               '发布日期', '图片链接', '图片数量']
-    ws.append(headers)
-
-    for item in data_list:
-        row = [
-            item.get('title', ''),
-            item.get('author', ''),
-            item.get('url', ''),
-            item.get('summary', ''),
-            item.get('content', ''),
-            item.get('travel_days', ''),
-            item.get('per_capita_cost', ''),
-            item.get('publish_date', ''),
-            item.get('image_urls', ''),
-            item.get('image_count', 0)
-        ]
-        ws.append(row)
-
-    wb.save(filename)
-    print(f"数据已保存至: {filename}")
-
-
-def save_data(data_list):
-    """根据配置保存数据"""
-    if SAVE_FORMAT == "excel":
-        save_to_excel(data_list, OUTPUT_FILE_EXCEL)
-    elif SAVE_FORMAT == "txt":
-        save_to_txt(data_list, OUTPUT_FILE_TXT)
-    elif SAVE_FORMAT == "both":
-        save_to_excel(data_list, OUTPUT_FILE_EXCEL)
-        save_to_txt(data_list, OUTPUT_FILE_TXT)
-
-
-def main():
+async def main():
     """主函数"""
-    print("=" * 50)
-    print("携程游记爬虫启动")
-    print(f"关键词: {KEYWORD}")
-    print(f"保存路径: {SAVE_PATH}")
-    print(f"保存格式: {SAVE_FORMAT}")
-    print(f"使用本地浏览器: {USE_LOCAL_BROWSER}")
-    print("=" * 50)
-
-    # 获取Cookie
-    print("\n正在获取Cookie...")
-    cookies = get_cookies_flexible()
-    update_headers_with_cookies(cookies)
-
-    all_travels = []
-
-    # 遍历列表页
-    for page in range(START_PAGE, END_PAGE + 1):
-        url = BASE_URL.format(page)
-        print(f"\n正在处理第{page}页: {url}")
-        html = get_page(url)
-
-        if not html:
-            print(f"第{page}页获取失败，跳过")
-            continue
-
-        travels = parse_travel_list(html)
-        print(f"第{page}页共找到 {len(travels)} 篇游记")
-        all_travels.extend(travels)
-        time.sleep(1)
-
-    print(f"\n共找到 {len(all_travels)} 篇游记，开始获取详情页...")
-
-    # 多线程获取详情
-    pool = Pool(THREAD_POOL_SIZE)
-    detailed_travels = pool.map(fetch_and_parse_detail, all_travels)
-    pool.close()
-    pool.join()
-
-    # 保存数据
-    save_data(detailed_travels)
-    print(f"\n爬取完成！共成功获取 {len(detailed_travels)} 篇游记的详细内容")
+    crawler = CtripTravelCrawler()
+    await crawler.start()
 
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
