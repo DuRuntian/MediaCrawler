@@ -381,11 +381,22 @@ def parse_travel_list(html):
     selector = etree.HTML(html)
     results = []
 
-    travel_items = selector.xpath('//a[contains(@class, "cursor-pointer")]')
-    if not travel_items:
-        travel_items = selector.xpath('//div[contains(@class, "travel-item")]//a')
-    if not travel_items:
-        travel_items = selector.xpath('//a[contains(@href, "/travels/")]')
+    # 多种XPath策略
+    xpath_strategies = [
+        '//a[contains(@href, "/travels/")]',  # 最广泛匹配
+        '//div[contains(@class, "travel-item")]//a',
+        '//div[contains(@class, "journal-item")]//a',
+        '//a[contains(@class, "journal")]',
+        '//a[contains(@class, "post")]',
+        '//div[@class="container"]//a[contains(@href, "/travels/")]',
+    ]
+
+    travel_items = []
+    for xpath in xpath_strategies:
+        travel_items = selector.xpath(xpath)
+        if travel_items:
+            print(f"[解析] 使用策略 '{xpath}' 找到 {len(travel_items)} 个元素")
+            break
 
     for item in travel_items:
         try:
@@ -395,22 +406,45 @@ def parse_travel_list(html):
             if not href or '/travels/' not in href:
                 continue
 
-            title_elem = item.xpath('.//h2//text()') or item.xpath('.//h3//text()') or item.xpath('.//span//text()')
-            title = ''.join([t.strip() for t in title_elem if t.strip()]) if title_elem else ''
+            # 尝试多种方式获取标题
+            title = ''
+            for title_xpath in ['.//h2//text()', './/h3//text()', './/span//text()',
+                               './/div[contains(@class, "title")]//text()',
+                               './/a//text()', './/text()']:
+                title_elem = item.xpath(title_xpath)
+                if title_elem:
+                    title = ''.join([t.strip() for t in title_elem if t.strip()])
+                    if title and len(title) > 3:
+                        break
 
-            if not title:
+            if not title or len(title) < 5:
                 title_match = re.search(r'/travels/[^/]+/(\d+)\.html', href)
                 if title_match:
                     title = f"游记-{title_match.group(1)}"
 
-            author_elem = item.xpath('.//span[contains(@class, "author")]//text()') or \
-                         item.xpath('.//div[contains(@class, "author")]//text()')
-            author = ''.join([a.strip() for a in author_elem if a.strip()]) if author_elem else '匿名'
+            # 获取作者
+            author = '匿名'
+            for author_xpath in ['.//span[contains(@class, "author")]//text()',
+                                 './/div[contains(@class, "author")]//text()',
+                                 './/span[contains(@class, "name")]//text()',
+                                 './/div[contains(@class, "user")]//text()']:
+                author_elem = item.xpath(author_xpath)
+                if author_elem:
+                    author = ''.join([a.strip() for a in author_elem if a.strip()])
+                    if author:
+                        break
 
-            summary_elem = item.xpath('.//p[contains(@class, "desc")]//text()') or \
-                          item.xpath('.//p[contains(@class, "summary")]//text()') or \
-                          item.xpath('.//div[contains(@class, "summary")]//text()')
-            summary = ''.join([s.strip() for s in summary_elem if s.strip()]) if summary_elem else ''
+            # 获取摘要
+            summary = ''
+            for summary_xpath in ['.//p[contains(@class, "desc")]//text()',
+                                 './/p[contains(@class, "summary")]//text()',
+                                 './/div[contains(@class, "summary")]//text()',
+                                 './/p//text()']:
+                summary_elem = item.xpath(summary_xpath)
+                if summary_elem:
+                    summary = ''.join([s.strip() for s in summary_elem if s.strip()])
+                    if summary and len(summary) > 10:
+                        break
 
             url = href
             if url and not url.startswith('http'):
@@ -420,13 +454,14 @@ def parse_travel_list(html):
                 results.append({
                     'title': title,
                     'url': url,
-                    'summary': summary,
+                    'summary': summary[:200] if summary else '',
                     'author': author
                 })
         except Exception as e:
             print(f"解析条目时出错: {e}")
             continue
 
+    # 去重
     seen = set()
     unique_results = []
     for r in results:
@@ -434,6 +469,7 @@ def parse_travel_list(html):
             seen.add(r['url'])
             unique_results.append(r)
 
+    print(f"[解析] 列表页共找到 {len(unique_results)} 篇游记")
     return unique_results
 
 
@@ -441,47 +477,83 @@ def parse_travel_detail(html, base_data):
     """解析游记详情页"""
     selector = etree.HTML(html)
 
-    content_blocks = selector.xpath('//div[contains(@class, "article-content")]//text()')
-    if not content_blocks:
-        content_blocks = selector.xpath('//div[contains(@class, "rich_media_content")]//text()')
-    if not content_blocks:
-        content_blocks = selector.xpath('//div[contains(@class, "travel-content")]//text()')
-    if not content_blocks:
-        content_blocks = selector.xpath('//article//text()')
+    # 尝试多种方式提取正文
+    content_selectors = [
+        '//div[contains(@class, "article-content")]//text()',
+        '//div[contains(@class, "rich_media_content")]//text()',
+        '//div[contains(@class, "travel-content")]//text()',
+        '//div[contains(@class, "content")]//text()',
+        '//div[contains(@class, "main-content")]//text()',
+        '//article//text()',
+        '//div[contains(@class, "detail")]//text()',
+        '//div[contains(@class, "text")]//text()',
+        '//div[contains(@id, "content")]//text()',
+        '//div[contains(@class, "bd")]//text()',
+    ]
 
-    full_content = ''.join(content_blocks).strip() if content_blocks else ''
-    full_content = re.sub(r'\s+', ' ', full_content)
+    full_content = ''
+    for content_xpath in content_selectors:
+        content_blocks = selector.xpath(content_xpath)
+        if content_blocks:
+            full_content = ''.join(content_blocks).strip()
+            full_content = re.sub(r'\s+', ' ', full_content)
+            if len(full_content) > 100:
+                print(f"[详情解析] 使用策略 '{content_xpath}' 获取到 {len(full_content)} 字符")
+                break
 
+    # 提取图片链接
     img_urls = []
-    img_elements = selector.xpath('//div[contains(@class, "article-content")]//img/@src')
-    if not img_elements:
-        img_elements = selector.xpath('//div[contains(@class, "rich_media_content")]//img/@src')
-    if not img_elements:
-        img_elements = selector.xpath('//div[contains(@class, "travel-content")]//img/@src')
-    if not img_elements:
-        img_elements = selector.xpath('//img[contains(@class, "content-img")]/@src')
-    if not img_elements:
-        img_elements = selector.xpath('//article//img/@src')
+    img_selectors = [
+        '//div[contains(@class, "article-content")]//img/@src',
+        '//div[contains(@class, "rich_media_content")]//img/@src',
+        '//div[contains(@class, "travel-content")]//img/@src',
+        '//img[contains(@class, "content-img")]/@src',
+        '//article//img/@src',
+        '//div[contains(@class, "content")]//img/@src',
+        '//div[contains(@class, "main-content")]//img/@src',
+        '//img/@src',
+    ]
 
-    for img in img_elements:
-        if img and not img.startswith('data:'):
-            if img.startswith('//'):
-                img = f'https:{img}'
-            img_urls.append(img)
+    for img_xpath in img_selectors:
+        img_elements = selector.xpath(img_xpath)
+        if img_elements:
+            for img in img_elements:
+                if img and not img.startswith('data:') and 'http' in img:
+                    if img.startswith('//'):
+                        img = f'https:{img}'
+                    img_urls.append(img)
+            if img_urls:
+                print(f"[详情解析] 使用策略 '{img_xpath}' 获取到 {len(img_urls)} 张图片")
+                break
 
-    meta_text = selector.xpath('//div[contains(@class, "travel-info")]//text()')
-    if not meta_text:
-        meta_text = selector.xpath('//div[contains(@class, "info-bar")]//text()')
-    if not meta_text:
-        meta_text = selector.xpath('//div[contains(@class, "meta")]//text()')
-    meta_str = ''.join(meta_text) if meta_text else ''
+    # 提取meta信息
+    meta_selectors = [
+        '//div[contains(@class, "travel-info")]//text()',
+        '//div[contains(@class, "info-bar")]//text()',
+        '//div[contains(@class, "meta")]//text()',
+        '//div[contains(@class, "tag")]//text()',
+        '//div[contains(@class, "info")]//text()',
+        '//span[contains(@class, "days")]//text()',
+        '//span[contains(@class, "cost")]//text()',
+    ]
 
+    meta_str = ''
+    for meta_xpath in meta_selectors:
+        meta_text = selector.xpath(meta_xpath)
+        if meta_text:
+            meta_str = ''.join(meta_text)
+            if meta_str:
+                break
+
+    # 正则提取出游天数
     days_match = re.search(r'(\d+)\s*天', meta_str)
     travel_days = days_match.group(1) if days_match else ''
 
+    # 正则提取人均花费
     cost_match = re.search(r'人均[花费]*[\:：]?\s*(\d+)', meta_str)
     per_capita_cost = cost_match.group(1) if cost_match else ''
 
+    # 提取发布时间
     time_match = re.search(r'(\d{4}-\d{1,2}-\d{1,2})', meta_str)
     publish_date = time_match.group(1) if time_match else ''
 
@@ -507,8 +579,12 @@ def fetch_and_parse_detail(travel_item):
     html = get_page(url)
     if html:
         travel_item = parse_travel_detail(html, travel_item)
+        # 打印内容长度帮助调试
+        content_len = len(travel_item.get('content', ''))
+        print(f"  -> 获取到内容 {content_len} 字符，图片 {travel_item.get('image_count', 0)} 张")
     else:
         travel_item.update({'content': '获取失败', 'image_urls': '', 'image_count': 0})
+        print(f"  -> 获取详情页失败")
 
     time.sleep(0.5)
     return travel_item
