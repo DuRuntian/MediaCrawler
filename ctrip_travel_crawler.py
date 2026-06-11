@@ -24,6 +24,10 @@ from urllib.parse import quote
 # ==================== 可配置参数（用户可在此修改） ====================
 # 关键词（可修改为任意目的地或主题，如"上海"、"厦门"、"海边"等）
 KEYWORD = "徐州"
+# 保存路径（默认为当前目录）
+SAVE_PATH = "."
+# 保存格式：excel / txt / both
+SAVE_FORMAT = "excel"
 # 爬取页码范围（1到END_PAGE）
 START_PAGE = 1
 END_PAGE = 5
@@ -33,8 +37,7 @@ THREAD_POOL_SIZE = 3
 RETRY_TIMES = 3
 # 请求超时（秒）
 TIMEOUT = 20
-# 输出文件名
-OUTPUT_FILE = f'{KEYWORD}游记.xlsx'
+# ================================================================
 
 # 浏览器配置
 # 是否使用本地浏览器（True=使用本地Chrome/Edge，False=使用chromedriver-autoinstaller自动下载）
@@ -44,6 +47,10 @@ DEBUG_PORT = 9222
 # 自定义浏览器路径（留空则自动检测）
 CUSTOM_BROWSER_PATH = ""
 # ================================================================
+
+# 输出文件名（根据保存格式和关键词生成）
+OUTPUT_FILE_EXCEL = f'{SAVE_PATH}/{KEYWORD}游记.xlsx'
+OUTPUT_FILE_TXT = f'{SAVE_PATH}/{KEYWORD}游记.txt'
 
 # 构建搜索页URL模板（支持关键词搜索）
 BASE_URL = f'`https://you.ctrip.com/search/travels/{{}}?keyword={quote(KEYWORD)}`'
@@ -507,6 +514,26 @@ def fetch_and_parse_detail(travel_item):
     return travel_item
 
 
+def save_to_txt(data_list, filename):
+    """保存数据到Txt"""
+    with open(filename, 'w', encoding='utf-8') as f:
+        for i, item in enumerate(data_list, 1):
+            f.write(f"{'='*50}\n")
+            f.write(f"【第{i}篇】\n")
+            f.write(f"标题: {item.get('title', '')}\n")
+            f.write(f"作者: {item.get('author', '')}\n")
+            f.write(f"链接: {item.get('url', '')}\n")
+            f.write(f"摘要: {item.get('summary', '')}\n")
+            f.write(f"出游天数: {item.get('travel_days', '')}天\n")
+            f.write(f"人均花费: {item.get('per_capita_cost', '')}元\n")
+            f.write(f"发布日期: {item.get('publish_date', '')}\n")
+            f.write(f"图片数量: {item.get('image_count', 0)}\n")
+            f.write(f"正文: {item.get('content', '')}\n")
+            f.write(f"图片链接: {item.get('image_urls', '')}\n")
+            f.write(f"{'='*50}\n\n")
+    print(f"数据已保存至: {filename}")
+
+
 def save_to_excel(data_list, filename):
     """保存数据到Excel"""
     wb = openpyxl.Workbook()
@@ -536,11 +563,24 @@ def save_to_excel(data_list, filename):
     print(f"数据已保存至: {filename}")
 
 
+def save_data(data_list):
+    """根据配置保存数据"""
+    if SAVE_FORMAT == "excel":
+        save_to_excel(data_list, OUTPUT_FILE_EXCEL)
+    elif SAVE_FORMAT == "txt":
+        save_to_txt(data_list, OUTPUT_FILE_TXT)
+    elif SAVE_FORMAT == "both":
+        save_to_excel(data_list, OUTPUT_FILE_EXCEL)
+        save_to_txt(data_list, OUTPUT_FILE_TXT)
+
+
 def main():
     """主函数"""
     print("=" * 50)
     print("携程游记爬虫启动")
     print(f"关键词: {KEYWORD}")
+    print(f"保存路径: {SAVE_PATH}")
+    print(f"保存格式: {SAVE_FORMAT}")
     print(f"使用本地浏览器: {USE_LOCAL_BROWSER}")
     print("=" * 50)
 
@@ -574,8 +614,8 @@ def main():
     pool.close()
     pool.join()
 
-    # 保存到Excel
-    save_to_excel(detailed_travels, OUTPUT_FILE)
+    # 保存数据
+    save_data(detailed_travels)
     print(f"\n爬取完成！共成功获取 {len(detailed_travels)} 篇游记的详细内容")
 
 
