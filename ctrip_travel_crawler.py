@@ -8,6 +8,9 @@
 支持自动获取Cookie和关键词搜索
 """
 
+import os
+import platform
+import subprocess
 import time
 import re
 import requests
@@ -32,6 +35,14 @@ RETRY_TIMES = 3
 TIMEOUT = 20
 # 输出文件名
 OUTPUT_FILE = f'{KEYWORD}游记.xlsx'
+
+# 浏览器配置
+# 是否使用本地浏览器（True=使用本地Chrome/Edge，False=使用chromedriver-autoinstaller自动下载）
+USE_LOCAL_BROWSER = True
+# 本地浏览器调试端口
+DEBUG_PORT = 9222
+# 自定义浏览器路径（留空则自动检测）
+CUSTOM_BROWSER_PATH = ""
 # ================================================================
 
 # 构建搜索页URL模板（支持关键词搜索）
@@ -42,157 +53,305 @@ ua = UserAgent()
 HEADERS = {
     'User-Agent': ua.random,
     'Referer': '`https://you.ctrip.com/`',
-    'Cookie': '',  # 自动获取，无需手动填写
+    'Cookie': '',
 }
 
 
-def get_cookie_from_login():
-    """
-    通过登录接口获取Cookie
-    注意：这种方式获取的Cookie可能权限有限，建议使用Selenium方式
-    """
-    try:
-        # 尝试访问携程登录页面获取初始Cookie
-        session = requests.Session()
-        session.headers.update(HEADERS)
-        # 访问首页获取基础Cookie
-        session.get('`https://www.ctrip.com/`', timeout=10)
-        return session.cookies.get_dict()
-    except Exception as e:
-        print(f"获取Cookie失败: {e}")
-        return {}
+# ==================== 浏览器管理类（参考MediaCrawler项目） ====================
 
+class BrowserLauncher:
+    """浏览器启动器，检测和启动本地Chrome/Edge浏览器"""
 
-def get_cookies_with_selenium():
-    """
-    使用Selenium自动登录获取Cookie（需要安装selenium和chromedriver）
-    这种方式可以绕过登录限制，获取完整Cookie
-    """
-    try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
-        import chromedriver_autoinstaller
+    def __init__(self):
+        self.system = platform.system()
+        self.browser_process = None
+        self.debug_port = None
 
-        # 自动安装chromedriver
-        chromedriver_autoinstaller.install()
+    def detect_browser_paths(self):
+        """检测系统中可用的浏览器路径"""
+        paths = []
 
-        # 配置Chrome选项
-        chrome_options = Options()
-        chrome_options.add_argument('--headless')  # 无头模式
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--window-size=1920,1080')
-        # 设置User-Agent
-        chrome_options.add_argument(f'user-agent={ua.random}')
+        if self.system == "Windows":
+            possible_paths = [
+                os.path.expandvars(r"%PROGRAMFILES%\Google\Chrome\Application\chrome.exe"),
+                os.path.expandvars(r"%PROGRAMFILES(X86)%\Google\Chrome\Application\chrome.exe"),
+                os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+                os.path.expandvars(r"%PROGRAMFILES%\Microsoft\Edge\Application\msedge.exe"),
+                os.path.expandvars(r"%PROGRAMFILES(X86)%\Microsoft\Edge\Application\msedge.exe"),
+            ]
+        elif self.system == "Darwin":  # macOS
+            possible_paths = [
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta",
+                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            ]
+        else:  # Linux
+            possible_paths = [
+                "/usr/bin/google-chrome",
+                "/usr/bin/google-chrome-stable",
+                "/usr/bin/chromium-browser",
+                "/usr/bin/chromium",
+                "/usr/bin/microsoft-edge",
+            ]
 
-        driver = webdriver.Chrome(options=chrome_options)
+        for path in possible_paths:
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                paths.append(path)
 
+        return paths
+
+    def find_available_port(self, start_port=9222):
+        """查找可用端口"""
+        import socket
+        port = start_port
+        while port < start_port + 100:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(('localhost', port))
+                    return port
+            except OSError:
+                port += 1
+        raise RuntimeError(f"无法找到可用端口，从 {start_port} 到 {port-1}")
+
+    def launch_browser(self, browser_path, debug_port, headless=False, user_data_dir=None):
+        """启动浏览器进程"""
+        args = [
+            browser_path,
+            f"--remote-debugging-port={debug_port}",
+            "--remote-debugging-address=0.0.0.0",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-features=TranslateUI",
+            "--disable-ipc-flooding-protection",
+            "--disable-hang-monitor",
+            "--disable-prompt-on-repost",
+            "--disable-sync",
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",
+            "--exclude-switches=enable-automation",
+            "--disable-infobars",
+        ]
+
+        if headless:
+            args.extend(["--headless=new", "--disable-gpu"])
+        else:
+            args.extend(["--start-maximized"])
+
+        if user_data_dir:
+            args.append(f"--user-data-dir={user_data_dir}")
+
+        print(f"[浏览器] 启动中: {browser_path}")
+        print(f"[浏览器] 调试端口: {debug_port}")
+
+        if self.system == "Windows":
+            process = subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        else:
+            process = subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                preexec_fn=os.setsid
+            )
+
+        self.browser_process = process
+        return process
+
+    def wait_for_browser_ready(self, debug_port, timeout=30):
+        """等待浏览器就绪"""
+        import socket
+        print(f"[浏览器] 等待浏览器启动... (端口 {debug_port})")
+
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(1)
+                    if s.connect_ex(('localhost', debug_port)) == 0:
+                        print("[浏览器] 浏览器已就绪")
+                        return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        print("[浏览器] 浏览器启动超时")
+        return False
+
+    def get_browser_info(self, browser_path):
+        """获取浏览器信息"""
         try:
-            # 访问携程游记搜索页
-            search_url = f'`https://you.ctrip.com/search/travels/?keyword={quote(KEYWORD)}`'
-            driver.get(search_url)
+            name = "Unknown"
+            if "chrome" in browser_path.lower():
+                name = "Google Chrome"
+            elif "edge" in browser_path.lower() or "msedge" in browser_path.lower():
+                name = "Microsoft Edge"
+            elif "chromium" in browser_path.lower():
+                name = "Chromium"
 
-            # 等待页面加载
-            time.sleep(3)
+            result = subprocess.run([browser_path, "--version"],
+                                  capture_output=True, text=True, encoding='utf-8', errors='ignore', timeout=5)
+            version = result.stdout.strip() if result.stdout else "Unknown"
+            return name, version
+        except Exception:
+            return "Unknown", "Unknown"
 
-            # 获取Cookie
-            cookies = driver.get_cookies()
-            cookie_dict = {cookie['name']: cookie['value'] for cookie in cookies}
+    def cleanup(self):
+        """清理浏览器进程"""
+        if not self.browser_process:
+            return
 
-            print(f"Selenium成功获取 {len(cookies)} 个Cookie")
-            return cookie_dict
-
+        print("[浏览器] 关闭中...")
+        try:
+            if self.system == "Windows":
+                self.browser_process.terminate()
+                self.browser_process.wait(timeout=5)
+            else:
+                import signal
+                os.killpg(os.getpgid(self.browser_process.pid), signal.SIGTERM)
+                self.browser_process.wait(timeout=5)
+        except Exception as e:
+            print(f"[浏览器] 关闭异常: {e}")
         finally:
-            driver.quit()
-
-    except ImportError as e:
-        print(f"Selenium未安装或配置不正确: {e}")
-        print("提示：安装命令 - pip install selenium chromedriver-autoinstaller")
-        return None
-    except Exception as e:
-        print(f"Selenium获取Cookie失败: {e}")
-        return None
+            self.browser_process = None
 
 
-def get_cookies_with_playwright():
+def get_browser_cookies_via_playwright():
     """
-    使用Playwright自动登录获取Cookie（需要安装playwright和浏览器）
-    另一种无头浏览器方案，比Selenium更现代
+    使用Playwright通过CDP连接本地浏览器获取Cookie
     """
     try:
         from playwright.sync_api import sync_playwright
+        import httpx
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent=ua.random,
-                viewport={'width': 1920, 'height': 1080}
-            )
-            page = context.new_page()
+        launcher = BrowserLauncher()
 
-            try:
-                # 访问搜索页
-                search_url = f'`https://you.ctrip.com/search/travels/?keyword={quote(KEYWORD)}`'
-                page.goto(search_url, timeout=30000)
-                time.sleep(3)
+        # 获取浏览器路径
+        browser_path = None
+        if CUSTOM_BROWSER_PATH and os.path.isfile(CUSTOM_BROWSER_PATH):
+            browser_path = CUSTOM_BROWSER_PATH
+        else:
+            browser_paths = launcher.detect_browser_paths()
+            if browser_paths:
+                browser_path = browser_paths[0]
 
-                # 获取Cookie
-                cookies = context.cookies()
-                cookie_dict = {cookie['name']: cookie['value'] for cookie in cookies}
+        if not browser_path:
+            print("[错误] 未找到本地浏览器，请安装Chrome或Edge")
+            return None
 
-                print(f"Playwright成功获取 {len(cookies)} 个Cookie")
-                return cookie_dict
+        browser_name, browser_version = launcher.get_browser_info(browser_path)
+        print(f"[浏览器] 检测到: {browser_name} ({browser_version})")
 
-            finally:
-                browser.close()
+        # 启动浏览器
+        debug_port = launcher.find_available_port(DEBUG_PORT)
+        user_data_dir = os.path.join(os.getcwd(), "browser_data", "ctrip_cookies")
+        os.makedirs(user_data_dir, exist_ok=True)
+
+        launcher.launch_browser(browser_path, debug_port, headless=True, user_data_dir=user_data_dir)
+
+        if not launcher.wait_for_browser_ready(debug_port, timeout=30):
+            print("[错误] 浏览器启动失败")
+            launcher.cleanup()
+            return None
+
+        # 通过CDP获取Cookie
+        cookies = None
+        try:
+            # 获取WebSocket URL
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"http://localhost:{debug_port}/json/version", timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    ws_url = data.get("webSocketDebuggerUrl")
+
+                    # 使用Playwright连接
+                    with sync_playwright() as p:
+                        browser = p.chromium.connect_over_cdp(ws_url, timeout=10000)
+                        if browser.contexts:
+                            context = browser.contexts[0]
+                            # 访问携程获取Cookie
+                            page = context.new_page()
+                            search_url = f'`https://you.ctrip.com/search/travels/?keyword={quote(KEYWORD)}`'
+                            page.goto(search_url, timeout=30000)
+                            time.sleep(3)
+                            cookies = context.cookies()
+                            browser.close()
+
+        except Exception as e:
+            print(f"[CDP] 连接异常: {e}")
+
+        launcher.cleanup()
+        return cookies
 
     except ImportError as e:
-        print(f"Playwright未安装或配置不正确: {e}")
-        print("提示：安装命令 - pip install playwright && playwright install")
+        print(f"[错误] Playwright未安装: {e}")
+        print("提示：pip install playwright && playwright install")
         return None
     except Exception as e:
-        print(f"Playwright获取Cookie失败: {e}")
+        print(f"[错误] 获取Cookie失败: {e}")
         return None
 
 
 def get_cookies_flexible():
     """
-    灵活的Cookie获取策略，依次尝试多种方式
+    灵活的Cookie获取策略
     """
     cookies = None
 
-    # 方式1：尝试Playwright（推荐，成功率最高）
-    print("正在尝试使用Playwright获取Cookie...")
-    cookies = get_cookies_with_playwright()
-    if cookies:
-        return cookies
+    # 方式1：使用Playwright + 本地浏览器（通过CDP连接）
+    if USE_LOCAL_BROWSER:
+        print("[Cookie] 正在使用本地浏览器获取Cookie...")
+        cookies = get_browser_cookies_via_playwright()
+        if cookies:
+            return cookies
 
-    # 方式2：尝试Selenium
-    print("正在尝试使用Selenium获取Cookie...")
-    cookies = get_cookies_with_selenium()
-    if cookies:
-        return cookies
+    # 方式2：使用chromedriver-autoinstaller自动下载
+    print("[Cookie] 正在使用自动下载浏览器获取Cookie...")
+    try:
+        import chromedriver_autoinstaller
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
 
-    # 方式3：使用基础Session
-    print("正在尝试基础方式获取Cookie...")
-    cookies = get_cookie_from_login()
-    if cookies:
-        return cookies
+        chromedriver_autoinstaller.install()
+        chrome_options = Options()
+        chrome_options.add_argument('--headless=new')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument(f'--user-agent={ua.random}')
 
-    print("警告：无法自动获取Cookie，将使用受限的匿名访问")
+        driver = webdriver.Chrome(options=chrome_options)
+        try:
+            search_url = f'`https://you.ctrip.com/search/travels/?keyword={quote(KEYWORD)}`'
+            driver.get(search_url)
+            time.sleep(3)
+            cookies = driver.get_cookies()
+            print(f"[Selenium] 获取到 {len(cookies)} 个Cookie")
+            return {c['name']: c['value'] for c in cookies}
+        finally:
+            driver.quit()
+    except Exception as e:
+        print(f"[Selenium] 失败: {e}")
+
+    print("[警告] 无法自动获取Cookie，将使用受限访问")
     return {}
 
 
 def update_headers_with_cookies(cookies):
     """更新请求头中的Cookie"""
     if cookies:
-        cookie_str = '; '.join([f'{k}={v}' for k, v in cookies.items()])
+        if isinstance(cookies, list):
+            cookie_str = '; '.join([f"{c['name']}={c['value']}" for c in cookies])
+        else:
+            cookie_str = '; '.join([f'{k}={v}' for k, v in cookies.items()])
         HEADERS['Cookie'] = cookie_str
-        print("Cookie已更新到请求头")
+        print(f"[Cookie] 已更新 ({len(cookies)} 项)")
 
 
 def get_page(url, retry=RETRY_TIMES):
@@ -206,21 +365,16 @@ def get_page(url, retry=RETRY_TIMES):
                 print(f"请求失败，状态码: {response.status_code}")
         except RequestException as e:
             print(f"请求异常: {e}")
-        time.sleep(3)  # 重试前等待
+        time.sleep(3)
     return None
 
 
 def parse_travel_list(html):
-    """
-    解析游记列表页，提取每篇游记的基本信息
-    """
+    """解析游记列表页，提取每篇游记的基本信息"""
     selector = etree.HTML(html)
     results = []
 
-    # 通过XPath提取游记卡片
     travel_items = selector.xpath('//a[contains(@class, "cursor-pointer")]')
-
-    # 备选方案
     if not travel_items:
         travel_items = selector.xpath('//div[contains(@class, "travel-item")]//a')
     if not travel_items:
@@ -231,32 +385,26 @@ def parse_travel_list(html):
             href = item.xpath('./@href')
             href = href[0] if href else ''
 
-            # 过滤非游记详情页的链接
             if not href or '/travels/' not in href:
                 continue
 
-            # 提取标题
             title_elem = item.xpath('.//h2//text()') or item.xpath('.//h3//text()') or item.xpath('.//span//text()')
             title = ''.join([t.strip() for t in title_elem if t.strip()]) if title_elem else ''
 
             if not title:
-                # 尝试从链接本身获取标题
                 title_match = re.search(r'/travels/[^/]+/(\d+)\.html', href)
                 if title_match:
                     title = f"游记-{title_match.group(1)}"
 
-            # 提取作者
             author_elem = item.xpath('.//span[contains(@class, "author")]//text()') or \
                          item.xpath('.//div[contains(@class, "author")]//text()')
             author = ''.join([a.strip() for a in author_elem if a.strip()]) if author_elem else '匿名'
 
-            # 提取摘要
             summary_elem = item.xpath('.//p[contains(@class, "desc")]//text()') or \
                           item.xpath('.//p[contains(@class, "summary")]//text()') or \
                           item.xpath('.//div[contains(@class, "summary")]//text()')
             summary = ''.join([s.strip() for s in summary_elem if s.strip()]) if summary_elem else ''
 
-            # 处理URL
             url = href
             if url and not url.startswith('http'):
                 url = f'`https://you.ctrip.com{url}`'
@@ -272,7 +420,6 @@ def parse_travel_list(html):
             print(f"解析条目时出错: {e}")
             continue
 
-    # 去重
     seen = set()
     unique_results = []
     for r in results:
@@ -284,12 +431,9 @@ def parse_travel_list(html):
 
 
 def parse_travel_detail(html, base_data):
-    """
-    解析游记详情页，提取正文、图片、游记信息等
-    """
+    """解析游记详情页"""
     selector = etree.HTML(html)
 
-    # 提取正文（多种匹配方式）
     content_blocks = selector.xpath('//div[contains(@class, "article-content")]//text()')
     if not content_blocks:
         content_blocks = selector.xpath('//div[contains(@class, "rich_media_content")]//text()')
@@ -299,10 +443,8 @@ def parse_travel_detail(html, base_data):
         content_blocks = selector.xpath('//article//text()')
 
     full_content = ''.join(content_blocks).strip() if content_blocks else ''
-    # 清理多余空白
     full_content = re.sub(r'\s+', ' ', full_content)
 
-    # 提取图片链接
     img_urls = []
     img_elements = selector.xpath('//div[contains(@class, "article-content")]//img/@src')
     if not img_elements:
@@ -320,7 +462,6 @@ def parse_travel_detail(html, base_data):
                 img = f'https:{img}'
             img_urls.append(img)
 
-    # 提取游记信息字段
     meta_text = selector.xpath('//div[contains(@class, "travel-info")]//text()')
     if not meta_text:
         meta_text = selector.xpath('//div[contains(@class, "info-bar")]//text()')
@@ -328,19 +469,15 @@ def parse_travel_detail(html, base_data):
         meta_text = selector.xpath('//div[contains(@class, "meta")]//text()')
     meta_str = ''.join(meta_text) if meta_text else ''
 
-    # 正则提取出游天数
     days_match = re.search(r'(\d+)\s*天', meta_str)
     travel_days = days_match.group(1) if days_match else ''
 
-    # 正则提取人均花费
     cost_match = re.search(r'人均[花费]*[\:：]?\s*(\d+)', meta_str)
     per_capita_cost = cost_match.group(1) if cost_match else ''
 
-    # 提取发布时间
     time_match = re.search(r'(\d{4}-\d{1,2}-\d{1,2})', meta_str)
     publish_date = time_match.group(1) if time_match else ''
 
-    # 更新数据
     base_data.update({
         'content': full_content,
         'image_urls': '; '.join(img_urls[:20]),
@@ -376,7 +513,6 @@ def save_to_excel(data_list, filename):
     ws = wb.active
     ws.title = f'{KEYWORD}游记'
 
-    # 表头
     headers = ['标题', '作者', '链接', '摘要', '正文', '出游天数', '人均花费',
                '发布日期', '图片链接', '图片数量']
     ws.append(headers)
@@ -402,19 +538,20 @@ def save_to_excel(data_list, filename):
 
 def main():
     """主函数"""
-    # 第一步：自动获取Cookie
     print("=" * 50)
     print("携程游记爬虫启动")
     print(f"关键词: {KEYWORD}")
+    print(f"使用本地浏览器: {USE_LOCAL_BROWSER}")
     print("=" * 50)
 
+    # 获取Cookie
     print("\n正在获取Cookie...")
     cookies = get_cookies_flexible()
     update_headers_with_cookies(cookies)
 
     all_travels = []
 
-    # 第二步：遍历列表页，获取所有游记概要
+    # 遍历列表页
     for page in range(START_PAGE, END_PAGE + 1):
         url = BASE_URL.format(page)
         print(f"\n正在处理第{page}页: {url}")
@@ -431,13 +568,13 @@ def main():
 
     print(f"\n共找到 {len(all_travels)} 篇游记，开始获取详情页...")
 
-    # 第三步：多线程获取详情页内容
+    # 多线程获取详情
     pool = Pool(THREAD_POOL_SIZE)
     detailed_travels = pool.map(fetch_and_parse_detail, all_travels)
     pool.close()
     pool.join()
 
-    # 第四步：保存到Excel
+    # 保存到Excel
     save_to_excel(detailed_travels, OUTPUT_FILE)
     print(f"\n爬取完成！共成功获取 {len(detailed_travels)} 篇游记的详细内容")
 
