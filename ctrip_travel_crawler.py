@@ -53,13 +53,13 @@ OUTPUT_FILE_EXCEL = f'{SAVE_PATH}/{KEYWORD}游记.xlsx'
 OUTPUT_FILE_TXT = f'{SAVE_PATH}/{KEYWORD}游记.txt'
 
 # 构建搜索页URL模板（支持关键词搜索）
-BASE_URL = f'`https://you.ctrip.com/search/travels/{{}}?keyword={quote(KEYWORD)}`'
+BASE_URL = f'https://you.ctrip.com/search/travels/{{}}?keyword={quote(KEYWORD)}'
 
 # 请求头配置
 ua = UserAgent()
 HEADERS = {
     'User-Agent': ua.random,
-    'Referer': '`https://you.ctrip.com/`',
+    'Referer': 'https://you.ctrip.com/',
     'Cookie': '',
 }
 
@@ -285,7 +285,7 @@ def get_browser_cookies_via_playwright():
                             context = browser.contexts[0]
                             # 访问携程获取Cookie
                             page = context.new_page()
-                            search_url = f'`https://you.ctrip.com/search/travels/?keyword={quote(KEYWORD)}`'
+                            search_url = f'https://you.ctrip.com/search/travels/?keyword={quote(KEYWORD)}'
                             page.goto(search_url, timeout=30000)
                             time.sleep(3)
                             cookies = context.cookies()
@@ -335,7 +335,7 @@ def get_cookies_flexible():
 
         driver = webdriver.Chrome(options=chrome_options)
         try:
-            search_url = f'`https://you.ctrip.com/search/travels/?keyword={quote(KEYWORD)}`'
+            search_url = f'https://you.ctrip.com/search/travels/?keyword={quote(KEYWORD)}'
             driver.get(search_url)
             time.sleep(3)
             cookies = driver.get_cookies()
@@ -414,7 +414,7 @@ def parse_travel_list(html):
 
             url = href
             if url and not url.startswith('http'):
-                url = f'`https://you.ctrip.com{url}`'
+                url = f'https://you.ctrip.com{url}'
 
             if url and title:
                 results.append({
